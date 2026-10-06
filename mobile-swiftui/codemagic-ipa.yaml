@@ -1,0 +1,38 @@
+workflows:
+  cinemora-ios-ipa:
+    name: Cinemora iOS IPA
+    max_build_duration: 60
+    environment:
+      xcode: latest
+      vars:
+        BUNDLE_ID: app.serval4238.taurus3258
+      groups:
+        - app_store_connect
+      ios_signing:
+        distribution_type: app_store
+        bundle_identifier: app.serval4238.taurus3258
+    scripts:
+      - name: Install XcodeGen
+        script: |
+          brew install xcodegen || brew upgrade xcodegen
+      - name: Generate Xcode project
+        script: |
+          cd mobile-swiftui
+          xcodegen generate --spec project.yml
+      - name: Apply Codemagic signing profiles
+        script: |
+          cd mobile-swiftui
+          xcode-project use-profiles
+      - name: Build signed IPA
+        script: |
+          cd mobile-swiftui
+          mkdir -p build/ios/ipa
+          xcode-project build-ipa \
+            --project Cinemora.xcodeproj \
+            --scheme Cinemora \
+            --config Release \
+            --archive-xcargs "COMPILER_INDEX_STORE_ENABLE=NO"
+          find build -type f -name "*.ipa" -exec cp {} build/ios/ipa/ \;
+    artifacts:
+      - mobile-swiftui/build/ios/ipa/*.ipa
+      - /tmp/xcodebuild_logs/*.log
