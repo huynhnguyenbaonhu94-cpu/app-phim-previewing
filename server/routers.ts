@@ -1,0 +1,198 @@
+import { z } from "zod";
+import { COOKIE_NAME, ONE_YEAR_MS } from "@shared/const";
+import { addFavorite, clearWatchHistory, createLocalUser, getUserByEmail, isFavorite, listFavorites, listWatchHistory, recordWatchHistory, removeFavorite, removeWatchHistory, updateLocalAccountByAdmin } from "./db";
+import { getSessionCookieOptions } from "./_core/cookies";
+import { systemRouter } from "./_core/systemRouter";
+import { adminProcedure, protectedProcedure, publicProcedure, router } from "./_core/trpc";
+import { getCatalogMeta, getDailyUpdates, getHome, getMovieDetail, getMovies, getPersistentPosterSource, MAX_CINEMA_PAGE, protectImageSource, searchMovies } from "./cinema";
+import { createLocalSession, hashPassword, verifyPassword } from "./localAuth";
+import { listAccountDevices, listAllAccountSummaries, revokeAllSessions, revokeDevice, revokeSession } from "./accountSessions";
+import { TRPCError } from "@trpc/server";
+import { sendMovieRequestToTelegram } from "./_core/telegram";
+import { createTvStream, deleteTvStream, listTvStreams, saveTvPoster, saveTvSubtitle, updateTvStream } from "./tvStreams";
+import { createTvVideo, deleteTvVideo, listTvVideos, updateTvVideo } from "./tvVideos";
+import { approveQrLogin, completeQrLogin, createQrLoginChallenge, qrLoginStatus } from "./qrLogin";
+
+const pageInput = z.number().int().min(1).max(MAX_CINEMA_PAGE).optional();
+const slugInput = z.string().trim().min(2).max(120).regex(/^[a-z0-9-]+$/i);
+const movieSnapshot = z.object({
+  movieSlug: slugInput,
+  movieName: z.string().trim().min(1).max(255),
+  originName: z.string().trim().max(255).optional(),
+  posterUrl: z.string().startsWith("/api/cinema/image/").max(160).nullable().optional(),
+  year: z.number().int().min(1900).max(2100).nullable().optional(),
+});
+const emailInput = z.string().trim().email().max(320).transform((value) => value.toLowerCase());
+const passwordInput = z.string().min(8, "Mật khẩu phải có ít nhất 8 ký tự").max(128);
+const movieRequestCooldown = new Map<string, number>();
+const tvPosterInput = z.string().trim().max(1000).nullable().optional().refine((value) => {
+  if (!value) return true;
+  if (value.startsWith("/uploads/tv-posters/") || value.startsWith("uploads/tv-posters/")) return true;
+  try { return ["http:", "https:"].includes(new URL(value).protocol); } catch { return false; }
+}, "Poster phải là URL http(s) hoặc file đã upload trên máy chủ.");
+
+function setSessionCookie(ctx: { req: Parameters<typeof getSessionCookieOptions>[0]; res: { cookie: (name: string, value: string, options: Record<string, unknown>) => void } }, token: string) {
+  ctx.res.cookie(COOKIE_NAME, token, { ...getSessionCookieOptions(ctx.req), maxAge: ONE_YEAR_MS });
+}
+
+export const appRouter = router({
+  system: systemRouter,
+  auth: router({
+    me: publicProcedure.query(opts => opts.ctx.user),
+    register: publicProcedure.input(z.object({ name: z.string().trim().min(2).max(80), email: emailInput, password: passwordInput, deviceId: z.string().trim().max(160).optional(), deviceName: z.string().trim().max(160).optional() })).mutation(async ({ ctx, input }) => {
+      if (await getUserByEmail(input.email)) throw new TRPCError({ code: "CONFLICT", message: "Email này đã được đăng ký" });
+      const user = await createLocalUser({ name: input.name, email: input.email, passwordHash: await hashPassword(input.password) });
+      if (!user) throw new TRPCError({ code: "INTERNAL_SERVER_ERROR", message: "Không thể tạo tài khoản" });
+      setSessionCookie(ctx, await createLocalSession(user, ctx.req, input));
+      return { user };
+    }),
+    login: publicProcedure.input(z.object({ email: emailInput, password: z.string().min(1).max(128), deviceId: z.string().trim().max(160).optional(), deviceName: z.string().trim().max(160).optional() })).mutation(async ({ ctx, input }) => {
+      const user = await getUserByEmail(input.email);
+      if (!user || !(await verifyPassword(input.password, user.passwordHash))) throw new TRPCError({ code: "UNAUTHORIZED", message: "Email hoặc mật khẩu không đúng" });
+      setSessionCookie(ctx, await createLocalSession(user, ctx.req, input));
+      return { user };
+    }),
+    logout: publicProcedure.mutation(async ({ ctx }) => {
+      const token = ctx.req.headers.cookie?.match(new RegExp(`(?:^|;\\s*)${COOKIE_NAME}=([^;]+)`))?.[1];
+      await revokeSession(token);
+      const cookieOptions = getSessionCookieOptions(ctx.req);
+      ctx.res.clearCookie(COOKIE_NAME, { ...cookieOptions, maxAge: -1 });
+      return { success: true } as const;
+    }),
+    qrCreate: publicProcedure.input(z.object({ deviceId: z.string().trim().max(160).optional(), deviceName: z.string().trim().max(160).optional() })).mutation(({ ctx, input }) => createQrLoginChallenge(ctx.req, input)),
+    qrStatus: publicProcedure.input(z.object({ nonce: z.string().trim().min(32).max(220) })).query(({ input }) => qrLoginStatus(input.nonce)),
+    qrApprove: protectedProcedure.input(z.object({ nonce: z.string().trim().min(32).max(220), approved: z.boolean() })).mutation(({ ctx, input }) => approveQrLogin(input.nonce, ctx.user.id, input.approved)),
+    qrComplete: publicProcedure.input(z.object({ nonce: z.string().trim().min(32).max(220), deviceId: z.string().trim().max(160).optional(), deviceName: z.string().trim().max(160).optional() })).mutation(async ({ ctx, input }) => {
+      const result = await completeQrLogin(ctx.req, input.nonce, input);
+      setSessionCookie(ctx, result.token);
+      return { user: result.user };
+    }),
+  }),
+  cinema: router({
+    home: publicProcedure.input(z.object({ page: pageInput }).optional()).query(({ input }) => getHome(input?.page)),
+    list: publicProcedure.input(z.object({
+      kind: z.enum(["latest", "single", "series", "shows", "animation", "vietsub", "thuyetminh", "longtieng", "ongoing", "completed", "subteam", "theatrical"]),
+      page: pageInput,
+      category: z.string().trim().max(80).optional(),
+      country: z.string().trim().max(80).optional(),
+      year: z.number().int().min(1900).max(2100).optional(),
+      refresh: z.boolean().optional(),
+    })).query(({ input }) => getMovies(input)),
+    search: publicProcedure.input(z.object({ keyword: z.string().trim().min(2).max(80), page: pageInput })).query(({ input }) => searchMovies(input)),
+    detail: publicProcedure.input(z.object({ slug: slugInput })).query(({ input }) => getMovieDetail(input.slug)),
+    dailyUpdates: publicProcedure.input(z.object({ page: pageInput }).optional()).query(({ input }) => getDailyUpdates(input?.page)),
+    meta: publicProcedure.query(() => getCatalogMeta()),
+    submitRequest: publicProcedure.input(z.object({
+      title: z.string().trim().min(2, "Vui lòng nhập tên phim.").max(255),
+      // Keep this optional field permissive: users may paste an IMDb/TMDB URL,
+      // title ID, or a link copied from the app without a scheme.
+      link: z.string().trim().max(500).optional(),
+      priority: z.enum(["Thấp", "Bình thường", "Cao", "Khẩn cấp"]),
+      notes: z.string().trim().max(4000).optional(),
+      imageBase64: z.string().max(11_200_000).optional(),
+      imageMimeType: z.enum(["image/jpeg", "image/png", "image/webp"]).optional(),
+    })).mutation(async ({ ctx, input }) => {
+      const key = ctx.req.ip || ctx.req.get("user-agent") || "unknown";
+      const now = Date.now();
+      const previous = movieRequestCooldown.get(key) ?? 0;
+      if (now - previous < 30_000) {
+        throw new TRPCError({ code: "TOO_MANY_REQUESTS", message: "Vui lòng chờ 30 giây trước khi gửi yêu cầu tiếp theo." });
+      }
+      movieRequestCooldown.set(key, now);
+      try {
+        await sendMovieRequestToTelegram(input);
+        return { success: true } as const;
+      } catch (error) {
+        movieRequestCooldown.delete(key);
+        throw error;
+      }
+    }),
+  }),
+  tv: router({
+    list: publicProcedure.query(() => listTvStreams(false)),
+    adminList: adminProcedure.query(() => listTvStreams(true)),
+    videos: publicProcedure.input(z.object({ refresh: z.number().optional() }).optional()).query(() => listTvVideos(false)),
+    adminVideos: adminProcedure.query(() => listTvVideos(true)),
+    uploadPoster: adminProcedure.input(z.object({
+      base64: z.string().min(1).max(11_200_000),
+      mimeType: z.enum(["image/jpeg", "image/png", "image/webp"]),
+    })).mutation(({ input }) => saveTvPoster(input)),
+    uploadSubtitle: adminProcedure.input(z.object({
+      base64: z.string().min(1).max(28_000_000),
+      mimeType: z.enum(["text/vtt", "application/octet-stream"]),
+    })).mutation(({ input }) => saveTvSubtitle(input)),
+    create: adminProcedure.input(z.object({
+      name: z.string().trim().min(1).max(120),
+      streamUrl: z.string().trim().url().max(2000),
+      audioUrl: z.string().trim().url().max(2000).nullable().optional(),
+      logoUrl: z.string().trim().url().max(1000).nullable().optional(),
+      posterUrl: tvPosterInput,
+      description: z.string().trim().max(500).nullable().optional(),
+      sortOrder: z.number().int().min(0).max(100000).optional(),
+      isActive: z.boolean().optional(),
+    })).mutation(({ input }) => createTvStream(input)),
+    update: adminProcedure.input(z.object({
+      id: z.number().int().positive(),
+      name: z.string().trim().min(1).max(120),
+      streamUrl: z.string().trim().url().max(2000),
+      audioUrl: z.string().trim().url().max(2000).nullable().optional(),
+      logoUrl: z.string().trim().url().max(1000).nullable().optional(),
+      posterUrl: tvPosterInput,
+      description: z.string().trim().max(500).nullable().optional(),
+      sortOrder: z.number().int().min(0).max(100000).optional(),
+      isActive: z.boolean().optional(),
+    })).mutation(({ input: { id, ...input } }) => updateTvStream(id, input)),
+    remove: adminProcedure.input(z.object({ id: z.number().int().positive() })).mutation(({ input }) => deleteTvStream(input.id)),
+    createVideo: adminProcedure.input(z.object({
+      name: z.string().trim().min(1).max(180), logoUrl: z.string().trim().url().max(2000).nullable().optional(), description: z.string().trim().max(1000).nullable().optional(), sortOrder: z.number().int().min(0).max(100000).optional(), isActive: z.boolean().optional(), allowPip: z.boolean().optional(), isFeatured: z.boolean().optional(), featuredEffect: z.enum(["glow", "pulse", "ribbon", "spark"]).optional(),
+      episodes: z.array(z.object({ episodeNumber: z.number().int().min(1), name: z.string().trim().max(180).optional(), subtitleUrl: z.string().trim().max(2000).nullable().optional(), bilingualSubtitleUrl: z.string().trim().max(2000).nullable().optional(), subtitles: z.array(z.object({ language: z.string().trim().min(1).max(40), subtitleUrl: z.string().trim().max(2000) })).max(20).optional(), qualities: z.array(z.object({ label: z.string().trim().max(40), streamUrl: z.string().trim().url().max(2000), subtitleUrl: z.string().trim().max(2000).nullable().optional(), bilingualSubtitleUrl: z.string().trim().max(2000).nullable().optional(), subtitleTracks: z.array(z.object({ language: z.string().trim().min(1).max(40), subtitleUrl: z.string().trim().max(2000) })).max(20).optional() })).min(1) })).min(1),
+    })).mutation(({ input }) => createTvVideo(input)),
+    updateVideo: adminProcedure.input(z.object({
+      id: z.number().int().positive(), name: z.string().trim().min(1).max(180), logoUrl: z.string().trim().url().max(2000).nullable().optional(), description: z.string().trim().max(1000).nullable().optional(), sortOrder: z.number().int().min(0).max(100000).optional(), isActive: z.boolean().optional(), allowPip: z.boolean().optional(), isFeatured: z.boolean().optional(), featuredEffect: z.enum(["glow", "pulse", "ribbon", "spark"]).optional(),
+      episodes: z.array(z.object({ episodeNumber: z.number().int().min(1), name: z.string().trim().max(180).optional(), subtitleUrl: z.string().trim().max(2000).nullable().optional(), bilingualSubtitleUrl: z.string().trim().max(2000).nullable().optional(), subtitles: z.array(z.object({ language: z.string().trim().min(1).max(40), subtitleUrl: z.string().trim().max(2000) })).max(20).optional(), qualities: z.array(z.object({ label: z.string().trim().max(40), streamUrl: z.string().trim().url().max(2000), subtitleUrl: z.string().trim().max(2000).nullable().optional(), bilingualSubtitleUrl: z.string().trim().max(2000).nullable().optional(), subtitleTracks: z.array(z.object({ language: z.string().trim().min(1).max(40), subtitleUrl: z.string().trim().max(2000) })).max(20).optional() })).min(1) })).min(1),
+    })).mutation(({ input: { id, ...payload } }) => updateTvVideo(id, payload)),
+    removeVideo: adminProcedure.input(z.object({ id: z.number().int().positive() })).mutation(({ input }) => deleteTvVideo(input.id)),
+  }),
+  account: router({
+    devices: protectedProcedure.query(({ ctx }) => listAccountDevices(ctx.user.id)),
+    logoutDevice: protectedProcedure.input(z.object({ id: z.number().int().positive() })).mutation(({ ctx, input }) => revokeDevice(ctx.user.id, input.id)),
+    logoutAll: protectedProcedure.mutation(async ({ ctx }) => {
+      await revokeAllSessions(ctx.user.id);
+      const cookieOptions = getSessionCookieOptions(ctx.req);
+      ctx.res.clearCookie(COOKIE_NAME, { ...cookieOptions, maxAge: -1 });
+      return { success: true } as const;
+    }),
+    favorites: protectedProcedure.query(async ({ ctx }) => (await listFavorites(ctx.user.id)).map((item) => ({ ...item, posterUrl: protectImageSource(item.posterUrl) }))),
+    isFavorite: protectedProcedure.input(z.object({ movieSlug: slugInput })).query(({ ctx, input }) => isFavorite(ctx.user.id, input.movieSlug)),
+    addFavorite: protectedProcedure.input(movieSnapshot).mutation(async ({ ctx, input }) => addFavorite({ userId: ctx.user.id, ...input, posterUrl: await getPersistentPosterSource(input.movieSlug, input.posterUrl) })),
+    removeFavorite: protectedProcedure.input(z.object({ movieSlug: slugInput })).mutation(({ ctx, input }) => removeFavorite(ctx.user.id, input.movieSlug)),
+    history: protectedProcedure.query(async ({ ctx }) => (await listWatchHistory(ctx.user.id)).map((item) => ({ ...item, posterUrl: protectImageSource(item.posterUrl) }))),
+    recordHistory: protectedProcedure.input(movieSnapshot.extend({
+      episodeSlug: z.string().trim().max(140).optional(),
+      episodeName: z.string().trim().max(255).optional(),
+      watchedSeconds: z.number().int().min(0).max(86_400).optional(),
+      durationSeconds: z.number().int().min(0).max(86_400).optional(),
+    })).mutation(async ({ ctx, input }) => recordWatchHistory({ userId: ctx.user.id, ...input, posterUrl: await getPersistentPosterSource(input.movieSlug, input.posterUrl) })),
+    removeHistory: protectedProcedure.input(z.object({ movieSlug: slugInput, episodeSlug: z.string().trim().max(140).optional() })).mutation(({ ctx, input }) => removeWatchHistory(ctx.user.id, input.movieSlug, input.episodeSlug)),
+    clearHistory: protectedProcedure.mutation(({ ctx }) => clearWatchHistory(ctx.user.id)),
+  }),
+  adminAccounts: router({
+    list: adminProcedure.query(() => listAllAccountSummaries()),
+    devices: adminProcedure.input(z.object({ userId: z.number().int().positive() })).query(({ input }) => listAccountDevices(input.userId)),
+    logoutAll: adminProcedure.input(z.object({ userId: z.number().int().positive() })).mutation(({ input }) => revokeAllSessions(input.userId)),
+    update: adminProcedure.input(z.object({
+      id: z.number().int().positive(),
+      name: z.string().trim().min(2).max(120).optional(),
+      email: z.string().trim().email().max(255).optional(),
+      password: z.string().min(8, "Mật khẩu phải có ít nhất 8 ký tự").max(200).optional(),
+      role: z.enum(["user", "admin"]).optional(),
+    })).mutation(async ({ input }) => {
+      const { password, ...rest } = input;
+      const updated = await updateLocalAccountByAdmin({ ...rest, ...(password ? { passwordHash: await hashPassword(password) } : {}) });
+      if (password) await revokeAllSessions(input.id);
+      return updated;
+    }),
+  }),
+});
+
+export type AppRouter = typeof appRouter;
