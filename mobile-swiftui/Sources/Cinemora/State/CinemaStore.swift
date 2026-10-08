@@ -1,4 +1,5 @@
 import Combine
+import Observation
 import Foundation
 
 struct HomeSection: Identifiable {
@@ -8,51 +9,46 @@ struct HomeSection: Identifiable {
 }
 
 @MainActor
-final class CinemaStore: ObservableObject {
-    @Published private(set) var homeMovies: [Movie] = []
-    @Published private(set) var homeSections: [HomeSection] = []
-    @Published private(set) var homeLoading = false
-    @Published private(set) var homeLoadingMore = false
-    @Published private(set) var homeHasMore = false
-    @Published private(set) var homeError: String?
-    @Published private(set) var catalogMeta: CatalogMeta?
-    @Published private(set) var searchResults: [Movie] = []
-    @Published private(set) var searchLoading = false
-    @Published private(set) var searchError: String?
-    @Published private(set) var detailMovie: Movie?
-    @Published private(set) var detailLoading = false
-    @Published private(set) var detailError: String?
-    @Published private(set) var catalogMovies: [Movie] = []
-    @Published private(set) var catalogLoading = false
-    @Published private(set) var catalogError: String?
-    @Published private(set) var catalogHasMore = false
-    @Published private(set) var catalogPage = 1
-    @Published private(set) var localFavorites: [LocalMovieRecord] = []
-    @Published private(set) var localHistory: [LocalWatchRecord] = []
-    @Published private(set) var accountUser: RemoteAccountUser?
-    @Published private(set) var accountDevices: [RemoteAccountDevice] = []
-    @Published private(set) var accountLoading = false
-    @Published private(set) var accountError: String?
-    @Published var playbackDefaults = PlaybackDefaults()
-    @Published private(set) var tvStreams: [TvStream] = []
-    @Published private(set) var tvVideos: [TvVideo] = []
-    @Published private(set) var tvLoading = false
-    @Published private(set) var tvError: String?
-    @Published private(set) var hasNewHomeContent = false
+@Observable
+final class CinemaStore {
+    private(set) var homeMovies: [Movie] = []
+    private(set) var homeSections: [HomeSection] = []
+    private(set) var homeLoading = false
+    private(set) var homeLoadingMore = false
+    private(set) var homeHasMore = false
+    private(set) var homeError: String?
+    private(set) var catalogMeta: CatalogMeta?
+    private(set) var searchResults: [Movie] = []
+    private(set) var searchLoading = false
+    private(set) var searchError: String?
+    private(set) var detailMovie: Movie?
+    private(set) var detailLoading = false
+    private(set) var detailError: String?
+    private(set) var catalogMovies: [Movie] = []
+    private(set) var catalogLoading = false
+    private(set) var catalogError: String?
+    private(set) var catalogHasMore = false
+    private(set) var catalogPage = 1
+    private(set) var localFavorites: [LocalMovieRecord] = []
+    private(set) var localHistory: [LocalWatchRecord] = []
+    private(set) var accountUser: RemoteAccountUser?
+    private(set) var accountDevices: [RemoteAccountDevice] = []
+    private(set) var accountLoading = false
+    private(set) var accountError: String?
+    var playbackDefaults = PlaybackDefaults()
+    private(set) var hasNewHomeContent = false
 
     private let api = CinemaAPI.shared
     private let localDefaults = UserDefaults.standard
     private let playbackDefaultsKey = "cinemora.playback.defaults.v1"
-    private var homePage = 1
-    private var detailTask: Task<Void, Never>?
-    private var catalogTask: Task<Void, Never>?
-    private var detailRequestID = 0
-    private var catalogRequestID = 0
-    private var searchRequestID = 0
-    private var nextAuthAttemptAt = Date.distantPast
-    private var tvEventsTask: Task<Void, Never>?
-    private var tvVideoRefreshTask: Task<Void, Never>?
-    private var lastHomeRefreshAt: Date?
+    @ObservationIgnored private var homePage = 1
+    @ObservationIgnored private var detailTask: Task<Void, Never>?
+    @ObservationIgnored private var catalogTask: Task<Void, Never>?
+    @ObservationIgnored private var detailRequestID = 0
+    @ObservationIgnored private var catalogRequestID = 0
+    @ObservationIgnored private var searchRequestID = 0
+    @ObservationIgnored private var nextAuthAttemptAt = Date.distantPast
+    @ObservationIgnored private var lastHomeRefreshAt: Date?
     private let homeSectionConfig: [(kind: String, title: String)] = [
         ("latest", "Phim Mới"),
         ("series", "Phim Bộ"),
@@ -78,82 +74,8 @@ final class CinemaStore: ObservableObject {
         }
     }
 
-    deinit { tvEventsTask?.cancel(); tvVideoRefreshTask?.cancel() }
-
-    func startTvLiveUpdates() async {
-        guard tvEventsTask == nil else { return }
-        tvLoading = tvStreams.isEmpty
-        do {
-            async let streams = api.tvStreams()
-            async let videos = api.tvVideos()
-            tvStreams = try await streams
-            tvVideos = (try? await videos) ?? []
-            tvError = nil
-        } catch {
-            tvError = error.localizedDescription
-        }
-        tvLoading = false
-        tvVideoRefreshTask?.cancel()
-        tvVideoRefreshTask = Task { @MainActor [weak self] in
-            guard let self else { return }
-            while !Task.isCancelled {
-                try? await Task.sleep(for: .seconds(12))
-                guard !Task.isCancelled else { return }
-                if let videos = try? await self.api.tvVideos() { self.tvVideos = videos }
-            }
-        }
-        tvEventsTask = Task { @MainActor [weak self] in
-            guard let self else { return }
-            while !Task.isCancelled {
-                do {
-                    let bytes = try await self.api.tvEventBytes()
-                    var eventData = ""
-                    for try await line in bytes.lines {
-                        if Task.isCancelled { return }
-                        if line.hasPrefix("data:") {
-                            eventData = String(line.dropFirst(5)).trimmingCharacters(in: .whitespaces)
-                        } else if line.isEmpty && !eventData.isEmpty {
-                            self.applyTvEvent(eventData)
-                            eventData = ""
-                        }
-                    }
-                } catch {
-                    if Task.isCancelled { return }
-                    try? await Task.sleep(for: .seconds(3))
-                }
-            }
-        }
-    }
-
-    func stopTvLiveUpdates() {
-        tvEventsTask?.cancel()
-        tvVideoRefreshTask?.cancel()
-        tvEventsTask = nil
-        tvVideoRefreshTask = nil
-    }
-
-    func refreshTvStreams() async {
-        do {
-            async let streams = api.tvStreams()
-            async let videos = api.tvVideos()
-            tvStreams = try await streams
-            tvVideos = (try? await videos) ?? tvVideos
-            tvError = nil
-        } catch {
-            tvError = error.localizedDescription
-        }
-        if tvEventsTask == nil { await startTvLiveUpdates() }
-    }
-
     func clearNewHomeContent() {
         hasNewHomeContent = false
-    }
-
-    private func applyTvEvent(_ payload: String) {
-        guard let data = payload.data(using: .utf8),
-              let snapshot = try? JSONDecoder().decode(TvStreamSnapshot.self, from: data) else { return }
-        tvStreams = snapshot.streams
-        tvError = nil
     }
 
     func isFavorite(_ movie: Movie) -> Bool {
@@ -227,7 +149,11 @@ final class CinemaStore: ObservableObject {
         guard accountUser != nil else { return }
         do {
             let response = try await api.me()
-            if let user = response.value { accountUser = user }
+            if let user = response.value {
+                // This runs on a timer in the tab shell. Writing an identical
+                // value would still invalidate every tab, so compare first.
+                if user != accountUser { accountUser = user }
+            }
             else {
                 clearAccountState()
             }
@@ -374,7 +300,7 @@ final class CinemaStore: ObservableObject {
         do {
             let devices = try await api.accountDevices()
             guard accountUser?.id == expectedUserID else { return }
-            accountDevices = devices
+            if devices != accountDevices { accountDevices = devices }
         }
         catch {
             if accountUser != nil { accountError = error.localizedDescription }
@@ -609,5 +535,122 @@ final class CinemaStore: ObservableObject {
                 catalogError = error.localizedDescription
             }
         }
+    }
+}
+
+
+// MARK: - Live TV
+
+/// The television tab's own store.
+///
+/// It is deliberately separate from `CinemaStore`. The TV screen holds a
+/// long-lived server-sent-events connection, and its snapshots arrive every few
+/// seconds (live counts change constantly). While that state lived in the shared
+/// store, every snapshot invalidated *every* view that observed the store — all
+/// five tabs plus any pushed screen — so the whole app re-rendered while you were
+/// somewhere else entirely. That is what made taps land late, back buttons
+/// occasionally need several presses, and tab switches stutter.
+@MainActor
+@Observable
+final class TvStore {
+    private(set) var streams: [TvStream] = []
+    private(set) var videos: [TvVideo] = []
+    private(set) var loading = false
+    private(set) var error: String?
+
+    private let api = CinemaAPI.shared
+    @ObservationIgnored private var eventsTask: Task<Void, Never>?
+    @ObservationIgnored private var videoRefreshTask: Task<Void, Never>?
+
+    deinit {
+        eventsTask?.cancel()
+        videoRefreshTask?.cancel()
+    }
+
+    /// Connects the live stream and starts the slow video poll. Calling it again
+    /// is harmless: the connection deliberately survives tab switches so coming
+    /// back to this tab is instant.
+    func startLive() async {
+        guard eventsTask == nil else { return }
+        let needsLoading = streams.isEmpty
+        if loading != needsLoading { loading = needsLoading }
+        do {
+            async let fetchedStreams = api.tvStreams()
+            async let fetchedVideos = api.tvVideos()
+            // Write only on an actual change: every write redraws this tab.
+            let newStreams = try await fetchedStreams
+            let newVideos = (try? await fetchedVideos) ?? []
+            if newStreams != streams { streams = newStreams }
+            if newVideos != videos { videos = newVideos }
+            if error != nil { error = nil }
+        } catch {
+            self.error = error.localizedDescription
+        }
+        if loading { loading = false }
+
+        videoRefreshTask?.cancel()
+        videoRefreshTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            while !Task.isCancelled {
+                // Posted videos change rarely; a slow poll keeps things quiet.
+                try? await Task.sleep(for: .seconds(45))
+                guard !Task.isCancelled else { return }
+                if let latest = try? await self.api.tvVideos(), latest != self.videos {
+                    self.videos = latest
+                }
+            }
+        }
+        eventsTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            while !Task.isCancelled {
+                do {
+                    let bytes = try await self.api.tvEventBytes()
+                    var eventData = ""
+                    for try await line in bytes.lines {
+                        if Task.isCancelled { return }
+                        if line.hasPrefix("data:") {
+                            eventData = String(line.dropFirst(5)).trimmingCharacters(in: .whitespaces)
+                        } else if line.isEmpty && !eventData.isEmpty {
+                            self.apply(eventData)
+                            eventData = ""
+                        }
+                    }
+                } catch {
+                    if Task.isCancelled { return }
+                    try? await Task.sleep(for: .seconds(3))
+                }
+            }
+        }
+    }
+
+    func stopLive() {
+        eventsTask?.cancel()
+        videoRefreshTask?.cancel()
+        eventsTask = nil
+        videoRefreshTask = nil
+    }
+
+    func refresh() async {
+        do {
+            async let fetchedStreams = api.tvStreams()
+            async let fetchedVideos = api.tvVideos()
+            let newStreams = try await fetchedStreams
+            let newVideos = (try? await fetchedVideos) ?? videos
+            if newStreams != streams { streams = newStreams }
+            if newVideos != videos { videos = newVideos }
+            if error != nil { error = nil }
+        } catch {
+            self.error = error.localizedDescription
+        }
+        if eventsTask == nil { await startLive() }
+    }
+
+    private func apply(_ payload: String) {
+        guard let data = payload.data(using: .utf8),
+              let snapshot = try? JSONDecoder().decode(TvStreamSnapshot.self, from: data) else { return }
+        // Server-sent snapshots repeat the current state more often than not;
+        // skipping the no-op write avoids redrawing the tab on every event.
+        if snapshot.streams != streams { streams = snapshot.streams }
+        if error != nil { error = nil }
     }
 }
